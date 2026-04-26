@@ -1,0 +1,5 @@
+Rank,Total_gas_ppm,H2,CH4,C2H6,C2H4,C2H2,CO,CO2,Note
+1,400,1,1,1,1,0,35,361,T2 misclassified as Healthy
+2,400,1,1,1,1,0,35,361,T2 misclassified as Healthy
+3,570,5,31,1,2,0,215,316,T2 misclassified as Healthy
+4,570,5,31,1,2,0,215,316,T2 misclassified as Healthy

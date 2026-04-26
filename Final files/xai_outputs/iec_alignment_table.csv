@@ -1,0 +1,6 @@
+Class,Top1_Feature,Top2_Feature,Top3_Feature,IEC_Expected,IEC_Feature_Rank
+Healthy,C2H4,C2H6,CH4,All low,2
+D1 Discharge,%C2H2,C2H2,CO,C2H2 + %%C2H2,1
+T1 <300C,C2H6,CH4,C2H4,C2H6 + CH4,1
+T2 300-700C,C2H6,C2H4,CH4,C2H4 + C2H6,2
+T3 >700C,C2H4,CH4,H2,C2H4 + CH4,1

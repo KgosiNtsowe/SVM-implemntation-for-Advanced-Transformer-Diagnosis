@@ -1,0 +1,6 @@
+Comparison,b,c,Chi2,Sig_p05
+kNN(A) vs kNN(B) — effect of SMOTE on kNN,2,0,0.5,NO
+DT(A)  vs DT(B)  — effect of SMOTE on DT,7,4,0.363636363636364,NO
+kNN(B) vs DT(B)  — fair algorithm comparison (SAME data),2,8,2.5,NO
+Duval  vs kNN(B) — ML vs industry standard (same data),192,0,190.005208333333,YES
+Duval  vs DT(B)  — ML vs industry standard (same data),192,6,172.853535353535,YES

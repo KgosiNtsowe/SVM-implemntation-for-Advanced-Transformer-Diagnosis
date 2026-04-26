@@ -1,0 +1,425 @@
+%   Project: Advanced Diagnostics for Power Transformers
+%   Author:  Kgosietsile Ntsowe | ID: 11409134
+%   PURPOSE:
+%   Compares the preformance of kNN , DT and SVM models for limited, 
+%   imbalanced data:
+%
+%   PART A — LEARNING CURVES
+%   Plots test Macro F1 vs training set size for SVM, kNN, DT.
+%   Shows the preformance with a variable range of training data
+%
+%   PART B — ERROR ANALYSIS
+%   Qualitative examination of  misclassified T2 test samples.
+%
+%   PART C — BIAS-VARIANCE ANALYSIS
+%   Train-test F1 gap at each training size to reveal potential overfitting
+%   behaviour.
+%
+%  INPUTS:
+%    pipeline_outputs/X_train_scaled.csv
+%    pipeline_outputs/X_test_scaled.csv
+%
+%  OUTPUTS → learning_curve_outputs/:
+%    learning_curves.png
+%    bias_variance.png
+%    error_analysis_table.csv
+%    t2_boundary_analysis.csv
+%    data_efficiency_summary.csv
+
+clc; clear; close all;
+rng(42);
+
+%% ---  SETUP -----------------------------------------------------
+script_dir = fileparts(mfilename('fullpath'));
+out_dir = fullfile(script_dir, 'learning_curve_outputs');
+if ~exist(out_dir, 'dir'), mkdir(out_dir); end
+
+CLASS_NAMES  = {'Healthy','D1 Discharge','T1 <300C','T2 300-700C','T3 >700C'};
+N_CLASSES    = 5;
+N_REPS       = 5;      % Repetitions per training size
+TRAIN_COUNTS = [112, 225, 338, 450, 563, 676, 788, 901, 1014, 1127];
+TRAIN_FRACS  = TRAIN_COUNTS / 1127;   % Approximate percentages
+fprintf('  Training sizes: %s\n', mat2str(TRAIN_COUNTS));
+fprintf('  Repetitions per size: %d\n', N_REPS);
+fprintf('  Total model fits: %d\n\n', length(TRAIN_COUNTS)*N_REPS*3);
+
+
+%% ---  LOAD DATA
+train_data = readmatrix(fullfile(script_dir, 'pipeline_outputs','X_train_scaled.csv'));
+test_data  = readmatrix(fullfile(script_dir, 'pipeline_outputs','X_test_scaled.csv'));
+
+X_train = train_data(:, 1:10);  y_train = train_data(:, 11);
+X_test  = test_data(:,  1:10);  y_test  = test_data(:,  11);
+
+n_train_full = size(X_train, 1);
+
+%% ---  LEARNING CURVES
+%    For each training size n:
+%      1. Draw a stratified subsample of n samples from training set
+%      2. Train model on subsample
+%      3. Evaluate on the FULL quarantined test set
+%      4. Repeat N_REPS times with different random seeds
+%      5. Report mean ± std across repetitions
+fprintf('--- PART A: Learning Curves ---\n');
+% Model configurations
+t_svm = templateSVM('KernelFunction', 'rbf', ...
+                    'BoxConstraint',  1000, ...
+                    'KernelScale',    1/sqrt(0.1), ...
+                    'Standardize',    false);
+
+% Storage: [n_sizes x n_reps] for each model
+n_sizes = length(TRAIN_COUNTS);
+svm_train_f1 = zeros(n_sizes, N_REPS);
+svm_test_f1  = zeros(n_sizes, N_REPS);
+knn_train_f1 = zeros(n_sizes, N_REPS);
+knn_test_f1  = zeros(n_sizes, N_REPS);
+dt_train_f1  = zeros(n_sizes, N_REPS);
+dt_test_f1   = zeros(n_sizes, N_REPS);
+
+for si = 1:n_sizes
+    n_sub = TRAIN_COUNTS(si);
+    fprintf('  Training size %4d (%3.0f%%):', n_sub, TRAIN_FRACS(si)*100);
+
+    for rep = 1:N_REPS
+        % Stratified subsample from training set
+        if n_sub >= n_train_full
+            % Full training set — no subsampling needed
+            X_sub = X_train;
+            y_sub = y_train;
+        else
+            % Stratified subsample using cvpartition
+            rng(rep * 7 + 42);   % Different seed per rep
+            cv_sub = cvpartition(y_train, 'HoldOut', ...
+                     1 - n_sub/n_train_full, 'Stratify', true);
+            sub_idx = training(cv_sub);
+            X_sub   = X_train(sub_idx, :);
+            y_sub   = y_train(sub_idx);
+        end
+
+        % Verify all classes present
+        if numel(unique(y_sub)) < N_CLASSES
+            warning('Size %d rep %d: missing classes, skipping', n_sub, rep);
+            svm_test_f1(si,rep) = NaN;
+            knn_test_f1(si,rep) = NaN;
+            dt_test_f1(si,rep)  = NaN;
+            continue;
+        end
+
+        % --- Train SVM ---
+        svm_mdl = fitcecoc(X_sub, y_sub, 'Learners', t_svm, ...
+                           'ClassNames', 0:4, 'Coding', 'onevsone');
+        pred_tr  = predict(svm_mdl, X_sub);
+        pred_te  = predict(svm_mdl, X_test);
+        [~, f1_tr, ~] = compute_metrics(y_sub,  pred_tr, N_CLASSES);
+        [~, f1_te, ~] = compute_metrics(y_test, pred_te, N_CLASSES);
+        svm_train_f1(si,rep) = f1_tr;
+        svm_test_f1(si,rep)  = f1_te;
+
+        % --- Train kNN ---
+bl_path = fullfile(script_dir, 'baseline_outputs', 'experiment_results.csv');
+best_k = 5; % Safe default fallback
+
+if exist(bl_path, 'file')
+    bl = readtable(bl_path, 'VariableNamingRule', 'preserve');
+    knn_row = bl(strcmp(bl.Experiment, 'B') & contains(bl.Model, 'kNN'), :);
+    
+    if ~isempty(knn_row)
+        try
+            % Safely cast any format (categorical, cell, char) to string, then double
+            parsed_k = str2double(string(knn_row.HyperParam(1)));
+            
+            % Verify it is a valid, positive number
+            if ~isnan(parsed_k) && parsed_k > 0
+                best_k = round(parsed_k); % Force it to be a clean integer
+            else
+                fprintf('  >> WARNING: Extracted k was NaN. Defaulting to k = 5\n');
+            end
+        catch
+            fprintf('  >> WARNING: Could not parse k. Defaulting to k = 5\n');
+        end
+    end
+end
+
+% Train the model with the safely extracted integer
+knn_mdl = fitcknn(X_sub, y_sub, 'NumNeighbors', best_k, ...
+                  'Distance', 'euclidean', 'Standardize', false);
+        pred_tr  = predict(knn_mdl, X_sub);
+        pred_te  = predict(knn_mdl, X_test);
+        [~, f1_tr, ~] = compute_metrics(y_sub,  pred_tr, N_CLASSES);
+        [~, f1_te, ~] = compute_metrics(y_test, pred_te, N_CLASSES);
+        knn_train_f1(si,rep) = f1_tr;
+        knn_test_f1(si,rep)  = f1_te;
+
+        % --- Train Decision Tree ---
+        dt_mdl   = fitctree(X_sub, y_sub, 'MaxNumSplits', 2^10-1);
+        pred_tr  = predict(dt_mdl, X_sub);
+        pred_te  = predict(dt_mdl, X_test);
+        [~, f1_tr, ~] = compute_metrics(y_sub,  pred_tr, N_CLASSES);
+        [~, f1_te, ~] = compute_metrics(y_test, pred_te, N_CLASSES);
+        dt_train_f1(si,rep) = f1_tr;
+        dt_test_f1(si,rep)  = f1_te;
+    end
+    fprintf(' SVM=%.4f  kNN=%.4f  DT=%.4f\n', ...
+        nanmean(svm_test_f1(si,:)), ...
+        nanmean(knn_test_f1(si,:)), ...
+        nanmean(dt_test_f1(si,:)));
+end
+
+% Compute means and standard deviations
+svm_te_mean = nanmean(svm_test_f1,  2);  svm_te_std = nanstd(svm_test_f1,  0, 2);
+svm_tr_mean = nanmean(svm_train_f1, 2);  svm_tr_std = nanstd(svm_train_f1, 0, 2);
+knn_te_mean = nanmean(knn_test_f1,  2);  knn_te_std = nanstd(knn_test_f1,  0, 2);
+knn_tr_mean = nanmean(knn_train_f1, 2);  knn_tr_std = nanstd(knn_train_f1, 0, 2);
+dt_te_mean  = nanmean(dt_test_f1,   2);  dt_te_std  = nanstd(dt_test_f1,   0, 2);
+dt_tr_mean  = nanmean(dt_train_f1,  2);  dt_tr_std  = nanstd(dt_train_f1,  0, 2);
+
+fprintf('\n');
+%% ---  DATA EFFICIENCY ANALYSIS
+%  For each model, find the minimum training size at which test
+%  performance first reaches 95% of its final (full-data) value.
+fprintf('--- PART B: Data Efficiency Analysis ---\n');
+models_te = {svm_te_mean, knn_te_mean, dt_te_mean};
+model_names = {'SVM','kNN','DT'};
+thresh = 0.95;
+
+efficiency_rows = {};
+for m = 1:3
+    te = models_te{m};
+    peak = te(end);
+    target = thresh * peak;
+    for si = 1:n_sizes
+        if te(si) >= target
+            fprintf('  %s: reaches %.0f%% of peak (%.4f) at %d samples (%d%% of data)\n', ...
+                model_names{m}, thresh*100, target, ...
+                TRAIN_COUNTS(si), round(TRAIN_FRACS(si)*100));
+            efficiency_rows(end+1,:) = {model_names{m}, ...
+                TRAIN_COUNTS(si), round(TRAIN_FRACS(si)*100), ...
+                target, peak};
+            break;
+        end
+    end
+end
+
+[knn_peak_val, knn_peak_idx] = max(knn_te_mean);
+eff_table = cell2table(efficiency_rows, 'VariableNames', ...
+    {'Model','Samples_at_95pct','Pct_of_data','Target_F1','Peak_F1'});
+writetable(eff_table, fullfile(out_dir, 'data_efficiency_summary.csv'));
+
+%% ---  BIAS-VARIANCE ANALYSIS
+fprintf('--- PART C: Bias-Variance Analysis ---\n');
+svm_gap = svm_tr_mean - svm_te_mean;
+knn_gap = knn_tr_mean - knn_te_mean;
+dt_gap  = dt_tr_mean  - dt_te_mean;
+
+fprintf('  Train-Test F1 Gap (final size):\n');
+fprintf('    SVM: %.4f — %s\n', svm_gap(end), ...
+    interpret_gap(svm_gap(end)));
+fprintf('    kNN: %.4f — %s\n', knn_gap(end), ...
+    interpret_gap(knn_gap(end)));
+fprintf('    DT:  %.4f — %s\n\n', dt_gap(end), ...
+    interpret_gap(dt_gap(end)));
+%% ---  ERROR ANALYSIS
+fprintf('--- PART D: Error Analysis ---\n');
+% Load raw dataset
+T_raw = readtable(fullfile(script_dir, 'Final_Transformer_Dataset_with_Duval.csv'), ...
+    'VariableNamingRule', 'preserve');
+gas_names = {'Hydrogen','Methane','Ethane','Ethylene','Acetylene', ...
+             'Carbon Monoxide','Carbon Dioxide'};
+X_raw = T_raw{:, gas_names};
+y_raw = T_raw.Fault_Type;
+
+% All T2 samples — sorted by total gas concentration
+t2_idx   = find(y_raw == 3);
+X_t2_raw = X_raw(t2_idx, :);
+total_gas = sum(X_t2_raw, 2);
+[~, sorted_idx] = sort(total_gas);
+
+% T2 class medians
+t2_median  = median(X_t2_raw);
+h_median   = median(X_raw(y_raw==0, :));
+
+fprintf('  T2 vs Healthy class medians (ppm):\n');
+gas_abbrev = {'H2','CH4','C2H6','C2H4','C2H2','CO','CO2'};
+for i = 1:7
+    fprintf('    %-6s: T2=%-8.1f  Healthy=%-8.1f\n', ...
+        gas_abbrev{i}, t2_median(i), h_median(i));
+end
+fprintf('\n');
+
+% The 2 boundary T2 samples (rank 1-2, lowest total gas)
+fprintf('  Boundary T2 samples (most likely misclassified):\n');
+for rank = 1:4
+    idx = sorted_idx(rank);
+    gases = X_t2_raw(idx,:);
+    fprintf('  Rank %d (total gas = %.0f ppm):\n', rank, total_gas(idx));
+    fprintf('    H2=%.0f CH4=%.0f C2H6=%.0f C2H4=%.0f C2H2=%.0f CO=%.0f CO2=%.0f\n', ...
+        gases(1), gases(2), gases(3), gases(4), gases(5), gases(6), gases(7));
+end
+fprintf('\n');
+
+% Save error analysis table
+err_rows = {};
+for rank = 1:4
+    idx = sorted_idx(rank);
+    gases = X_t2_raw(idx,:);
+    err_rows(end+1,:) = {rank, total_gas(idx), ...
+        gases(1), gases(2), gases(3), gases(4), gases(5), gases(6), gases(7), ...
+        'T2 misclassified as Healthy'};
+end
+err_table = cell2table(err_rows, 'VariableNames', ...
+    {'Rank','Total_gas_ppm','H2','CH4','C2H6','C2H4','C2H2','CO','CO2','Note'});
+writetable(err_table, fullfile(out_dir, 'error_analysis_table.csv'));
+
+%% ---  FIGURES
+
+% --- Figure 1: Learning Curves ---
+fig1 = figure('Position', [50 50 900 580]);
+
+% Test performance curves
+hold on;
+% SVM — red with shaded error
+fill([TRAIN_COUNTS, fliplr(TRAIN_COUNTS)], ...
+     [svm_te_mean'+svm_te_std', fliplr(svm_te_mean'-svm_te_std')], ...
+     [0.85 0.33 0.10], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+p1 = plot(TRAIN_COUNTS, svm_te_mean, 'r-o', 'LineWidth', 2.5, ...
+          'MarkerSize', 7, 'MarkerFaceColor', 'r', 'DisplayName', 'SVM (test)');
+
+% kNN — blue
+fill([TRAIN_COUNTS, fliplr(TRAIN_COUNTS)], ...
+     [knn_te_mean'+knn_te_std', fliplr(knn_te_mean'-knn_te_std')], ...
+     [0.00 0.45 0.74], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+p2 = plot(TRAIN_COUNTS, knn_te_mean, 'b-s', 'LineWidth', 2.5, ...
+          'MarkerSize', 7, 'MarkerFaceColor', 'b', 'DisplayName', 'kNN (test)');
+
+% DT — purple
+fill([TRAIN_COUNTS, fliplr(TRAIN_COUNTS)], ...
+     [dt_te_mean'+dt_te_std', fliplr(dt_te_mean'-dt_te_std')], ...
+     [0.49 0.18 0.56], 'FaceAlpha', 0.15, 'EdgeColor', 'none');
+p3 = plot(TRAIN_COUNTS, dt_te_mean, '-^', 'Color', [0.49 0.18 0.56], ...
+          'LineWidth', 2.5, 'MarkerSize', 7, 'MarkerFaceColor', ...
+          [0.49 0.18 0.56], 'DisplayName', 'DT (test)');
+
+% Annotate the kNN non-monotonic peak
+[~, knn_pi] = max(knn_te_mean);
+plot(TRAIN_COUNTS(knn_pi), knn_te_mean(knn_pi), 'bv', ...
+    'MarkerSize', 12, 'MarkerFaceColor', 'b');
+text(TRAIN_COUNTS(knn_pi)-20, knn_te_mean(knn_pi)+0.02, ...
+    sprintf('kNN peak\n%.4f', knn_te_mean(knn_pi)), ...
+    'FontSize', 8.5, 'Color', 'b', 'HorizontalAlignment', 'right');
+
+% Annotate 95% threshold lines
+yline(0.95 * svm_te_mean(end), '--r', 'LineWidth', 1, 'Alpha', 0.6);
+text(TRAIN_COUNTS(1)+10, 0.95*svm_te_mean(end)+0.012, ...
+    '95% of SVM peak', 'FontSize', 8, 'Color', 'r');
+
+% Duval baseline reference
+yline(0.3827, ':k', 'LineWidth', 1.5);
+text(TRAIN_COUNTS(1)+10, 0.3827+0.012, 'Duval Triangle baseline', ...
+    'FontSize', 8, 'Color', [0.3 0.3 0.3]);
+
+legend([p1 p2 p3], 'Location', 'southeast', 'FontSize', 11);
+xlabel('Training Set Size (samples)', 'FontSize', 12);
+ylabel('Macro F1 Score (Test Set)', 'FontSize', 12);
+title({'Learning Curves — SVM, k-NN, and Decision Tree'; ...
+       'Shaded regions = ±1 std across 5 repetitions'}, ...
+    'FontSize', 12, 'FontWeight', 'bold');
+xlim([TRAIN_COUNTS(1)-50, TRAIN_COUNTS(end)+50]);
+ylim([0.55 1.05]);
+grid on; box on;
+set(gca, 'FontSize', 11);
+
+% Add secondary x-axis with percentage labels
+ax1 = gca;
+ax1.XTickLabel = arrayfun(@(n) sprintf('%d\n(%.0f%%)', n, n/1127*100), ...
+    ax1.XTick, 'UniformOutput', false);
+
+saveas(fig1, fullfile(out_dir, 'learning_curves.png'));
+
+% --- Figure 2: Bias-Variance Plot ---
+fig2 = figure('Position', [100 100 900 520]);
+hold on;
+
+% SVM train-test curves
+plot(TRAIN_COUNTS, svm_tr_mean, 'r--', 'LineWidth', 2, 'DisplayName', 'SVM train');
+plot(TRAIN_COUNTS, svm_te_mean, 'r-',  'LineWidth', 2, 'DisplayName', 'SVM test');
+
+% kNN train-test curves
+plot(TRAIN_COUNTS, knn_tr_mean, 'b--', 'LineWidth', 2, 'DisplayName', 'kNN train');
+plot(TRAIN_COUNTS, knn_te_mean, 'b-',  'LineWidth', 2, 'DisplayName', 'kNN test');
+
+% DT train-test curves
+plot(TRAIN_COUNTS, dt_tr_mean, '--', 'Color', [0.49 0.18 0.56], ...
+     'LineWidth', 2, 'DisplayName', 'DT train');
+plot(TRAIN_COUNTS, dt_te_mean, '-',  'Color', [0.49 0.18 0.56], ...
+     'LineWidth', 2, 'DisplayName', 'DT test');
+
+legend('Location', 'southeast', 'FontSize', 10, 'NumColumns', 3);
+xlabel('Training Set Size (samples)', 'FontSize', 12);
+ylabel('Macro F1 Score', 'FontSize', 12);
+title({'Bias-Variance Analysis — Training vs Test Performance'; ...
+       'Dashed = training F1 | Solid = test F1 | Gap = variance'}, ...
+    'FontSize', 12, 'FontWeight', 'bold');
+ylim([0.55 1.05]); grid on; box on;
+set(gca, 'FontSize', 11);
+saveas(fig2, fullfile(out_dir, 'bias_variance.png'));
+
+% --- Figure 3: Data efficiency bar chart ---
+fig3 = figure('Position', [100 100 650 420]);
+pct_needed = [TRAIN_FRACS(find(svm_te_mean >= 0.95*svm_te_mean(end),1))*100, ...
+              TRAIN_FRACS(find(knn_te_mean >= 0.95*knn_te_mean(end),1))*100, ...
+              TRAIN_FRACS(find(dt_te_mean  >= 0.95*dt_te_mean(end),1))*100];
+bar_cols = [0.85 0.33 0.10; 0.00 0.45 0.74; 0.49 0.18 0.56];
+b = bar(pct_needed, 'FaceColor', 'flat');
+b.CData = bar_cols;
+for i = 1:3
+    text(i, pct_needed(i)+1.5, sprintf('%.0f%%', pct_needed(i)), ...
+        'HorizontalAlignment','center','FontSize',12,'FontWeight','bold');
+end
+set(gca,'XTickLabel',{'SVM','kNN','DT'},'FontSize',12);
+ylabel('% of Training Data Required', 'FontSize', 12);
+title({'Data Efficiency: Training Size to Reach 95% of Peak Performance'; ...
+       'Lower is better — model reaches near-peak with less data'}, ...
+    'FontSize', 12, 'FontWeight', 'bold');
+ylim([0 100]); grid on; box on;
+saveas(fig3, fullfile(out_dir, 'data_efficiency_bar.png'));
+
+%% ---  SUMMARY
+fprintf('  Learning Curve Final Values (full training set):\n');
+fprintf('    SVM: Train=%.4f  Test=%.4f  Gap=%.4f\n', ...
+    svm_tr_mean(end), svm_te_mean(end), svm_gap(end));
+fprintf('    kNN: Train=%.4f  Test=%.4f  Gap=%.4f\n', ...
+    knn_tr_mean(end), knn_te_mean(end), knn_gap(end));
+fprintf('    DT:  Train=%.4f  Test=%.4f  Gap=%.4f\n', ...
+    dt_tr_mean(end), dt_te_mean(end), dt_gap(end));
+fprintf('   kNN DEGRADES above %d samples (non-monotonic).\n', ...
+    TRAIN_COUNTS(knn_peak_idx));
+fprintf('   SVM reaches 95%% of peak at %d samples (%d%% of data).\n', ...
+    TRAIN_COUNTS(find(svm_te_mean >= 0.95*svm_te_mean(end),1)), ...
+    round(TRAIN_FRACS(find(svm_te_mean >= 0.95*svm_te_mean(end),1))*100));
+%% ---  LOCAL FUNCTIONS
+function [accuracy, macro_f1, per_class] = compute_metrics(y_true, y_pred, n_classes)
+    accuracy  = mean(y_true == y_pred);
+    per_class = zeros(n_classes, 3);
+    for c = 0:(n_classes-1)
+        tp = sum((y_pred==c) & (y_true==c));
+        fp = sum((y_pred==c) & (y_true~=c));
+        fn = sum((y_pred~=c) & (y_true==c));
+        if (tp+fp)==0, p=0; else, p=tp/(tp+fp); end
+        if (tp+fn)==0, r=0; else, r=tp/(tp+fn); end
+        if (p+r)==0,   f=0; else, f=2*p*r/(p+r); end
+        per_class(c+1,:) = [p, r, f];
+    end
+    macro_f1 = mean(per_class(:,3));
+end
+
+function label = interpret_gap(gap)
+    if gap < 0.02
+        label = 'Excellent generalisation — no overfitting';
+    elseif gap < 0.05
+        label = 'Good generalisation — minor variance';
+    elseif gap < 0.10
+        label = 'Moderate variance — some overfitting';
+    else
+        label = 'High variance — significant overfitting';
+    end
+end
