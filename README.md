@@ -68,7 +68,7 @@ Raw DGA Data (ppm)                  Preprocessing Pipeline
 
 1. Clone or download this repository:
 ```
-https://github.com/KgosiNtsowe/Machine-Learning.git
+https://github.com/KgosiNtsowe/SVM-implemntation-for-Advanced-Transformer-Diagnosis.git
 ```
 
 2. Scripts must be run in order — each checkpoint produces output files consumed by the next. 
